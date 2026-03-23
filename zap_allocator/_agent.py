@@ -19,7 +19,15 @@ let _collect = null;
 // Search all loaded modules for a Python C-API symbol.
 // More robust than matching by module name, which varies by platform
 // (.so on Linux, .dylib on macOS) and custom build location.
+//
+// Frida 16+ provides Module.findGlobalExportByName() which scans .dynsym
+// directly and works on BOLT-optimised binaries where .gnu.hash is stale.
+// Fall back to per-module getExportByName() for older Frida.
 function sym(name) {
+    if (typeof Module.findGlobalExportByName === 'function') {
+        const p = Module.findGlobalExportByName(name);
+        return (p && !p.isNull()) ? p : null;
+    }
     for (const mod of Process.enumerateModules()) {
         try {
             const p = mod.getExportByName(name);

@@ -1,6 +1,8 @@
 # zap-allocator
 
-Dumps detailed stats about memory pools in a running Python interpreter.
+Dumps detailed stats about memory pools in a running Python interpreter
+(supports 3.9-3.14, but does not support running under or against a
+freethreading build at the moment).
 
 Sould print something like
 

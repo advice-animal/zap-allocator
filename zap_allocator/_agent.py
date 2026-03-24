@@ -1,8 +1,19 @@
 """Frida JS agent injected into the target process.
 
 Injected once via setup(); collect() can be called repeatedly.
-sys._debugmallocstats() writes to the C-level stderr (fd 2), so we
-redirect fd 2 to a temp file at the OS level for each capture.
+
+Capture strategy: call _PyObject_DebugMallocStats() directly from native code,
+passing an open_memstream() FILE* instead of stderr.  This avoids any fd
+redirection — we never touch fd 2, never create a pipe, and never inject
+Python source into the target.
+
+Symbol resolution:
+  Fast path — sym() scans dynsym across all loaded modules.  Works for
+              framework/shared-library builds where the symbol is exported.
+  Slow path — if the symbol is absent from dynsym (stripped or static build),
+              ask ctypes.pythonapi inside the target process.  pythonapi opens
+              the Python runtime DLL directly via its known path, so it finds
+              internal symbols that were never placed in the global symbol table.
 """
 
 from __future__ import annotations
@@ -10,11 +21,7 @@ from __future__ import annotations
 _AGENT_JS = r"""
 'use strict';
 
-// _collect: cached callable — set during setup(), invoked during collect().
-// Calls _arena_capture() directly via PyObject_CallFunctionObjArgs, avoiding
-// PyRun_SimpleString (which compiles a new code object every call) and any
-// mutation of builtins (which was implicated in a one-block-per-second leak).
-let _collect = null;
+let _collectFn = null;
 
 // Search all loaded modules for a Python C-API symbol.
 // More robust than matching by module name, which varies by platform
@@ -43,105 +50,106 @@ function nfn(name, ret, args) {
     return new NativeFunction(p, ret, args);
 }
 
-function makeSetupRunner() {
-    const ensure  = nfn('PyGILState_Ensure',  'int',  []);
-    const release = nfn('PyGILState_Release', 'void', ['int']);
-    const runStr  = nfn('PyRun_SimpleString',  'int',  ['pointer']);
-    return function run(code) {
-        const state = ensure();
-        const ret   = runStr(Memory.allocUtf8String(code));
-        release(state);
-        return ret;
-    };
+// Locate _PyObject_DebugMallocStats, trying two strategies:
+//
+//   1. sym() — fast, zero overhead, covers exported symbols.
+//
+//   2. ctypes.pythonapi fallback — if the symbol is not in dynsym, inject a
+//      one-liner into the target that uses ctypes.pythonapi (which dlopen()s
+//      the Python runtime by its known path) to retrieve the address.
+//      The result is stored on __main__ as a plain int, then read back via
+//      PyLong_AsVoidPtr so we never need to parse or allocate anything.
+function findDebugMallocStats(ensure, release) {
+    const p = sym('_PyObject_DebugMallocStats');
+    if (p) return p;
+
+    // Slow path: ask ctypes inside the target.
+    const runStr  = nfn('PyRun_SimpleString',     'int',     ['pointer']);
+    const addMod  = nfn('PyImport_AddModule',     'pointer', ['pointer']);
+    const getAttr = nfn('PyObject_GetAttrString', 'pointer', ['pointer', 'pointer']);
+    const delAttr = nfn('PyObject_DelAttrString', 'int',     ['pointer', 'pointer']);
+    const asVoidP = nfn('PyLong_AsVoidPtr',       'pointer', ['pointer']);
+    const decRef  = nfn('Py_DecRef',              'void',    ['pointer']);
+
+    const state = ensure();
+    // ctypes.pythonapi opens the Python runtime DLL directly — it can resolve
+    // _PyObject_DebugMallocStats even when it has hidden ELF visibility,
+    // because pythonapi bypasses the global symbol table and goes straight to
+    // the runtime's own export table.
+    runStr(Memory.allocUtf8String(
+        'import ctypes as _ct, __main__ as _m;' +
+        '_m._dms_addr = _ct.cast(' +
+        '    _ct.pythonapi._PyObject_DebugMallocStats, _ct.c_void_p).value'
+    ));
+    const cMain   = Memory.allocUtf8String('__main__');
+    const cAttr   = Memory.allocUtf8String('_dms_addr');
+    const main    = addMod(cMain);
+    const addrObj = getAttr(main, cAttr);
+    const addrPtr = (addrObj && !addrObj.isNull()) ? asVoidP(addrObj) : ptr(0);
+    if (addrObj && !addrObj.isNull()) decRef(addrObj);
+    delAttr(main, cAttr);  // clean up scratchpad attribute
+    release(state);
+
+    return (addrPtr && !addrPtr.isNull()) ? addrPtr : null;
 }
 
-// Returns a function that calls _arena_capture() in the target and returns the
-// text.  The function object pointer is captured once here so that collect()
-// never touches the Python parser or the builtins dict.
+// Build a collect() closure.
+// _PyObject_DebugMallocStats(FILE *out) writes all pymalloc stats to *out*.
+// open_memstream() gives us a FILE* backed by a heap buffer that grows as
+// needed and is always null-terminated after fclose().  We pass that in,
+// then read back the text without ever touching stderr or any file descriptor.
 function makeCollector() {
-    const ensure   = nfn('PyGILState_Ensure',              'int',     []);
-    const release  = nfn('PyGILState_Release',             'void',    ['int']);
-    // PyImport_AddModule returns a *borrowed* reference — no decRef needed.
-    const addMod   = nfn('PyImport_AddModule',             'pointer', ['pointer']);
-    const getAttr  = nfn('PyObject_GetAttrString',         'pointer', ['pointer', 'pointer']);
-    // PyObject_CallObject(func, NULL) calls with no args (NULL args tuple).
-    // Prefer this over PyObject_CallFunctionObjArgs which is variadic and
-    // requires special ABI handling that NativeFunction does not provide.
-    const callFn   = nfn('PyObject_CallObject',            'pointer', ['pointer', 'pointer']);
-    const asUtf8   = nfn('PyUnicode_AsUTF8',               'pointer', ['pointer']);
-    const decRef   = nfn('Py_DecRef',                      'void',    ['pointer']);
+    const ensure     = nfn('PyGILState_Ensure',  'int',     []);
+    const release    = nfn('PyGILState_Release', 'void',    ['int']);
+    const openMem    = nfn('open_memstream',     'pointer', ['pointer', 'pointer']);
+    const fclose     = nfn('fclose',             'int',     ['pointer']);
+    const free       = nfn('free',               'void',    ['pointer']);
 
-    // Grab and permanently hold a reference to _arena_capture so we never
-    // need to look it up (or parse Python) again.
-    const cMain    = Memory.allocUtf8String('__main__');
-    const cFunc    = Memory.allocUtf8String('_arena_capture');
-
-    const state0   = ensure();
-    const mainMod  = addMod(cMain);           // borrowed — no decRef
-    const funcObj  = getAttr(mainMod, cFunc); // new ref — held for lifetime
-    release(state0);
-
-    if (funcObj.isNull()) return null;
+    const debugStatsPtr = findDebugMallocStats(ensure, release);
+    if (!debugStatsPtr) throw new Error('could not locate _PyObject_DebugMallocStats');
+    const debugStats = new NativeFunction(debugStatsPtr, 'void', ['pointer']);
 
     return function collect() {
-        const state  = ensure();
-        const result = callFn(funcObj, ptr('0x0'));   // _arena_capture() → str
-        const cstr   = result.isNull() ? ptr('0x0') : asUtf8(result);
-        const text   = cstr.isNull() ? '' : cstr.readUtf8String();
-        if (!result.isNull()) decRef(result);
+        // open_memstream writes buf/size through these two pointers.
+        // The buffer is always null-terminated after fclose(), so we only
+        // need bufPtrPtr; sizePtrPtr is passed because the API requires it.
+        const bufPtrPtr  = Memory.alloc(Process.pointerSize);
+        const sizePtrPtr = Memory.alloc(Process.pointerSize);
+
+        const fp = openMem(bufPtrPtr, sizePtrPtr);
+        if (fp.isNull()) return '';
+
+        // GIL is needed for _PyObject_DebugMallocStats; fclose/free are plain C.
+        const state = ensure();
+        debugStats(fp);
         release(state);
+
+        fclose(fp);  // flushes and finalises the null terminator
+
+        const bufPtr = bufPtrPtr.readPointer();
+        const text   = (bufPtr && !bufPtr.isNull()) ? bufPtr.readUtf8String() : '';
+        if (bufPtr && !bufPtr.isNull()) free(bufPtr);
         return text;
     };
 }
 
 rpc.exports = {
     setup: function() {
-        let run;
         try {
-            run = makeSetupRunner();
+            _collectFn = makeCollector();
         } catch (e) {
             return {ok: false, error: e.message};
         }
-
-        // Define _arena_capture() once.  It captures C-level stderr via an OS
-        // pipe (sys._debugmallocstats writes to fd 2 directly, bypassing
-        // Python's sys.stderr) and returns the decoded text.
-        const ret = run(`
-import sys as _sys, os as _os
-
-def _arena_capture():
-    fd2  = _os.dup(2)
-    r, w = _os.pipe()
-    _os.dup2(w, 2)
-    _os.close(w)
-    try:
-        _sys._debugmallocstats()
-    finally:
-        _os.dup2(fd2, 2)
-        _os.close(fd2)
-    data = b''
-    while True:
-        chunk = _os.read(r, 65536)
-        if not chunk:
-            break
-        data += chunk
-    _os.close(r)
-    return data.decode()
-`);
-        if (ret !== 0) return {ok: false, error: 'failed to define _arena_capture'};
-
-        try {
-            _collect = makeCollector();
-        } catch (e) {
-            return {ok: false, error: e.message};
-        }
-        if (!_collect) return {ok: false, error: 'could not get _arena_capture reference'};
         return {ok: true};
     },
 
     collect: function() {
-        if (!_collect) return {ok: false, error: 'call setup() first'};
-        return {ok: true, text: _collect()};
+        if (!_collectFn) return {ok: false, error: 'call setup() first'};
+        try {
+            return {ok: true, text: _collectFn()};
+        } catch (e) {
+            return {ok: false, error: e.message};
+        }
     },
 };
 """

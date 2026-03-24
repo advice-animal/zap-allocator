@@ -25,6 +25,8 @@ def _make_snap(
         n_arenas=n_arenas,
         highwater=n_arenas,
         arena_bytes=1 << 20,
+        pool_bytes=16 << 10,
+        unused_pools=0,
     )
 
 

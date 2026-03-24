@@ -16,9 +16,10 @@ def _render(snap: ArenaSnapshot, prev: Optional[ArenaSnapshot], n: int) -> str:
     if prev is not None:
         dt_part = f"  Δt {snap.ts - prev.ts:.1f}s"
     mb = snap.arena_bytes >> 20
+    kb = snap.pool_bytes >> 10
     lines.append(
         f"PID {snap.pid}  │  snapshot {n}"
-        f"  │  {snap.n_arenas} arenas × {mb} MiB  (highwater {snap.highwater})"
+        f"  │  {snap.n_arenas} arenas × {mb} MiB/{kb} KiB  (highwater {snap.highwater})"
         f"{dt_part}"
     )
     lines.append("")
@@ -60,6 +61,23 @@ def _render(snap: ArenaSnapshot, prev: Optional[ArenaSnapshot], n: int) -> str:
 
     if shown == 0:
         lines.append(f"{_DIM}  (no active size classes){_RST}")
+
+    # Free-pool row (pools in arenas not yet assigned to any size class)
+    fp = snap.unused_pools
+    fp_prev = prev.unused_pools if prev is not None else None
+    if fp or fp_prev:
+        row = f"{'free':>6}  {fp:>5}  {fp:>8,}  {'100.0%':>6}"
+        if has_delta:
+            delta = (fp - fp_prev) if fp_prev is not None else None
+            if not delta:
+                row += f"  {_DIM}{'':>9}{_RST}"
+            else:
+                sign = "+" if delta > 0 else ""
+                d_str = f"{sign}{delta:,}"
+                big = abs(delta) >= _LARGE_DELTA
+                color = _RED if delta > 0 else _GRN
+                row += f"  {_BOLD if big else ''}{color}{d_str:>9}{_RST}"
+        lines.append(row)
 
     # Total blocks summary
     total_used = sum(c.used for c in snap.classes)
